@@ -1,0 +1,172 @@
+import os
+import shutil
+import tarfile
+import pickle
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models, applications
+from sklearn.metrics import roc_curve
+from tensorflow.keras.preprocessing import image_dataset_from_directory
+from PIL import Image
+
+DATASET_DIR = "/content/dataset"
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+SPAM_URL = "https://www.cs.jhu.edu/~mdredze/datasets/image_spam/personal_image_spam.tar.gz"
+HAM_URL = "https://www.cs.jhu.edu/~mdredze/datasets/image_spam/personal_image_ham.tar.gz"
+SPAM_TAR = "personal_image_spam.tar.gz"
+HAM_TAR = "personal_image_ham.tar.gz"
+
+
+print("⬇️ FORCE DELETING AND RE-DOWNLOADING DATASETS...")
+
+if os.path.exists(SPAM_TAR): os.remove(SPAM_TAR)
+if os.path.exists(HAM_TAR): os.remove(HAM_TAR)
+
+!wget -q -O {SPAM_TAR} {SPAM_URL}
+print(f"   -> Re-downloaded {SPAM_TAR}")
+!wget -q -O {HAM_TAR} {HAM_URL}
+print(f"   -> Re-downloaded {HAM_TAR}")
+
+def extract_and_flatten(tar_path, label):
+    try:
+        with tarfile.open(tar_path, "r:gz") as t:
+            t.extractall(DATASET_DIR, filter='data')
+    except Exception:
+        with tarfile.open(tar_path, "r:gz") as t:
+            t.extractall(DATASET_DIR)
+
+    final_folder = os.path.join(DATASET_DIR, label)
+    os.makedirs(final_folder, exist_ok=True)
+
+    for root, dirs, files in os.walk(DATASET_DIR):
+        if label in os.path.basename(root) and root != final_folder:
+            for f in files:
+                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
+                    try:
+                        shutil.move(os.path.join(root, f), os.path.join(final_folder, f))
+                    except: pass
+
+if os.path.exists(DATASET_DIR):
+    shutil.rmtree(DATASET_DIR)
+os.makedirs(DATASET_DIR, exist_ok=True)
+
+extract_and_flatten(SPAM_TAR, "spam")
+extract_and_flatten(HAM_TAR, "ham")
+
+for f in os.listdir(DATASET_DIR):
+    if f not in ['spam', 'ham']:
+        path = os.path.join(DATASET_DIR, f)
+        if os.path.isdir(path):
+            try: shutil.rmtree(path)
+            except: pass
+
+print(f"✅ Data Extraction Complete.")
+print(f"   SPAM images initial count: {len(os.listdir(os.path.join(DATASET_DIR, 'spam')))}")
+print(f"   HAM  images initial count: {len(os.listdir(os.path.join(DATASET_DIR, 'ham')))}")
+
+
+
+def ultra_clean_and_convert(dir_path):
+    print(f"\n🔥🔥 ULTRA CLEANING: Verifying and converting ALL files to clean JPGs...")
+    removed = 0
+    validated = 0
+
+    for root, dirs, files in os.walk(dir_path, topdown=False):
+        for file in files:
+            file_path = os.path.join(root, file)
+
+            if file.startswith('.') or not file.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
+                try: os.remove(file_path); removed += 1
+                except: pass
+                continue
+
+            temp_path = file_path + ".temp.jpg"
+
+            try:
+                with Image.open(file_path) as img:
+                    rgb_im = img.convert('RGB')
+                    rgb_im.save(temp_path, "JPEG")
+
+                    os.remove(file_path)
+                    shutil.move(temp_path, file_path)
+                    validated += 1
+
+            except Exception as e:
+                try: os.remove(file_path)
+                except: pass
+
+                if os.path.exists(temp_path):
+                     os.remove(temp_path)
+                removed += 1
+
+    print(f"✅ ULTRA CLEANUP COMPLETE:")
+    print(f"   - Total files processed and validated: {validated}")
+    print(f"   - Total files deleted (corrupt): {removed}")
+
+ultra_clean_and_convert(DATASET_DIR)
+
+
+print("\n🔄 Loading Sanitized Dataset for Training...")
+train_ds = image_dataset_from_directory(
+    DATASET_DIR,
+    validation_split=0.2,
+    subset="training",
+    seed=123,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode='binary',
+    class_names=['ham', 'spam']
+)
+
+val_ds = image_dataset_from_directory(
+    DATASET_DIR,
+    validation_split=0.2,
+    subset="validation",
+    seed=123,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode='binary',
+    class_names=['ham', 'spam']
+)
+
+norm_layer = layers.Rescaling(1./255)
+train_ds = train_ds.map(lambda x, y: (norm_layer(x), y)).cache().prefetch(tf.data.AUTOTUNE)
+val_ds = val_ds.map(lambda x, y: (norm_layer(x), y)).cache().prefetch(tf.data.AUTOTUNE)
+
+
+base_model = applications.EfficientNetB0(
+    include_top=False,
+    input_shape=IMG_SIZE+(3,),
+    weights='imagenet'
+)
+base_model.trainable = False
+
+model = models.Sequential([
+    base_model,
+    layers.GlobalAveragePooling2D(),
+    layers.Dropout(0.2),
+    layers.Dense(1, activation='sigmoid')
+])
+
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+print("\n🚀 Starting Training (Safe Mode)...")
+history = model.fit(train_ds, validation_data=val_ds, epochs=5)
+
+
+print("\n⚖️ Saving Best Model & Threshold...")
+y_pred = model.predict(val_ds).ravel()
+y_true = np.concatenate([y for x, y in val_ds], axis=0)
+
+fpr, tpr, thresholds = roc_curve(y_true, y_pred)
+best_idx = np.argmax(tpr - fpr)
+best_thresh = thresholds[best_idx]
+
+print(f"✅ Optimal Threshold Detected: {best_thresh:.4f}")
+
+model.save("fixed_model.h5")
+with open("best_threshold.pkl", "wb") as f:
+    pickle.dump(best_thresh, f)
+
+print("🎉 DONE! You can now proceed to the final launch steps.")
